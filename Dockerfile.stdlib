@@ -1,0 +1,10 @@
+# Stdlib-only image: NO pip install, no PyPI access needed at build time.
+# In an air-gapped cluster you only need to mirror this one base image.
+# (You can swap python:3.12-slim for any python3 base you already mirror.)
+FROM python:3.12-slim
+WORKDIR /app
+COPY app_stdlib.py .
+ENV GUARDIAN_CONFIG=/etc/guardian/config.json GUARDIAN_PORT=8080
+EXPOSE 8080
+USER 65534:65534
+CMD ["python3", "app_stdlib.py"]

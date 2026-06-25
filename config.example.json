@@ -1,0 +1,16 @@
+{
+  "_comment": "Config for app_stdlib.py. Mounted at /etc/guardian/config.json. Host keys must equal the Prometheus instance label (the BMC IP).",
+  "defaults": {
+    "dry_run": true,
+    "auto_shutdown": true,
+    "grace_seconds": 120,
+    "reset_type": "GracefulShutdown",
+    "verify_tls": false,
+    "system_id": null
+  },
+  "hosts": {
+    "192.168.10.11": { "username": "guardian", "password": "CHANGE_ME_DELL_RW", "grace_seconds": 180 },
+    "192.168.10.12": { "username": "guardian", "password": "CHANGE_ME_LENOVO_RW" },
+    "192.168.10.13": { "username": "guardian", "password": "CHANGE_ME_SMC_RW" }
+  }
+}
