@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: idrac-exporter
+  namespace: bmc-guardian
+  labels: { app: idrac-exporter }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: idrac-exporter }
+  template:
+    metadata:
+      labels: { app: idrac-exporter }
+    spec:
+      containers:
+        - name: idrac-exporter
+          # GHCR is the current home for images (>= v2.3.0). Pin a real tag.
+          # 2.6.1 is the version loaded in idrac_exporter/idrac_exporter.tar (offline).
+          image: ghcr.io/mrlhansen/idrac_exporter:2.6.1
+          args: ["-config", "/etc/prometheus/idrac.yml"]
+          ports:
+            - { name: metrics, containerPort: 9348 }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits:   { cpu: 250m, memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 9348 }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          secret:
+            secretName: idrac-exporter-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: idrac-exporter
+  namespace: bmc-guardian
+  labels: { app: idrac-exporter }
+spec:
+  selector: { app: idrac-exporter }
+  ports:
+    - { name: metrics, port: 9348, targetPort: 9348 }

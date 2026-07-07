@@ -1,0 +1,35 @@
+# idrac_exporter is a multi-target exporter: it scrapes a BMC given by the
+# ?target= query param. The Probe CRD is the idiomatic Prometheus-Operator way to
+# do that (same pattern as blackbox_exporter). Each target becomes a scrape with
+# instance=<target>, which is what the alert rules and the controller key on.
+#
+# NOTE: the `release` label must match your kube-prometheus-stack Helm release so
+# the operator's probeSelector adopts this Probe. Check with:
+#   kubectl -n monitoring get prometheus -o yaml | grep -A5 probeSelector
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: idrac
+  namespace: bmc-guardian
+  labels:
+    release: kube-prometheus-stack
+spec:
+  jobName: idrac
+  # Redfish on-demand collection can be slow on big boxes (XE9680 has many
+  # components). Keep timeout < interval.
+  interval: 60s
+  scrapeTimeout: 30s
+  prober:
+    url: idrac-exporter.bmc-guardian.svc.cluster.local:9348
+    path: /metrics
+    scheme: http
+  targets:
+    staticConfig:
+      targets:
+        - 192.168.10.11   # Dell XE9680 iDRAC
+        - 192.168.10.12   # Lenovo XCC
+        # Supermicro (10.20.0.20) is monitored over IPMI, NOT Redfish, because its
+        # BMC gates Redfish behind a paid license (OemLicenseNotPassed). It lives in
+        # the ipmi Probe (15-ipmi-exporter-probe.yaml) instead. Do not add it here.
+      labels:
+        fleet: bmc

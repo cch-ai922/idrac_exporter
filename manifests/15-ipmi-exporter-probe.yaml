@@ -1,0 +1,30 @@
+# Probe that makes Prometheus scrape the Supermicro over IPMI.
+# ipmi_exporter is multi-target: /metrics?target=<IP>&module=supermicro
+# The Probe supplies ?target= from the target list; we inject &module=supermicro
+# via metricRelabelings->__param_module using a relabeling on the scrape.
+#
+# instance ends up = 10.20.0.20 (same as the idrac probe used), so the guardian
+# controller and the *_ipmi_* alert rules key on the same host.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: ipmi-supermicro
+  namespace: bmc-guardian
+  labels:
+    release: kube-prometheus-stack   # must match your stack's probeSelector
+spec:
+  jobName: ipmi
+  interval: 60s
+  scrapeTimeout: 30s
+  module: supermicro                 # becomes ?module=supermicro
+  prober:
+    url: ipmi-exporter.bmc-guardian.svc.cluster.local:9290
+    path: /metrics
+    scheme: http
+  targets:
+    staticConfig:
+      targets:
+        - 10.20.0.20                 # Supermicro BMC (IPMI-over-LAN)
+      labels:
+        fleet: bmc
+        vendor: supermicro

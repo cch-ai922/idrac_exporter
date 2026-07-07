@@ -11,6 +11,17 @@
   "hosts": {
     "192.168.10.11": { "username": "guardian", "password": "CHANGE_ME_DELL_RW", "grace_seconds": 180 },
     "192.168.10.12": { "username": "guardian", "password": "CHANGE_ME_LENOVO_RW" },
-    "192.168.10.13": { "username": "guardian", "password": "CHANGE_ME_SMC_RW" }
+    "10.20.0.20": {
+      "_comment": "Supermicro SSG-6049P-E1CR60H (X11 BMC). Its Redfish DATA API is license-locked (OemLicenseNotPassed), so Redfish power control also fails here. Use IPMI directly: prefer=true skips the dead Redfish path. Key MUST match the ipmi Probe target / alert instance (10.20.0.20).",
+      "username": "guardian", "password": "CHANGE_ME_SMC_RW",
+      "oob_shutdown": {
+        "method": "ipmitool",
+        "prefer": true,
+        "ipmi_host": "10.20.0.20",
+        "ipmi_user": "ADMIN",
+        "ipmi_password": "CHANGE_ME_SMC_IPMI",
+        "ipmi_interface": "lanplus"
+      }
+    }
   }
 }

@@ -12,8 +12,10 @@ import ssl
 import json
 import time
 import base64
+import shlex
 import logging
 import threading
+import subprocess
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse, parse_qs
@@ -57,42 +59,218 @@ def _ctx(verify):
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
+# Preferred ResetType substitutes when the one we asked for isn't advertised.
+# Old Supermicro X11 BMCs (Redfish 1.01) do NOT support GracefulShutdown/PushPowerButton;
+# they only expose On / ForceOff / ForceRestart / ForceOn / Nmi. Map accordingly.
+_RESET_FALLBACKS = {
+    "GracefulShutdown": ["GracefulShutdown", "ForceOff", "PushPowerButton"],
+    "ForceOff":         ["ForceOff", "GracefulShutdown", "PushPowerButton"],
+    "GracefulRestart":  ["GracefulRestart", "ForceRestart", "PushPowerButton"],
+    "ForceRestart":     ["ForceRestart", "GracefulRestart"],
+    "On":               ["On", "ForceOn", "PushPowerButton"],
+}
+
+
+def _read_err(e):
+    """Extract a useful message + body from an HTTPError."""
+    try:
+        body = e.read().decode(errors="replace")
+    except Exception:  # noqa: BLE001
+        body = ""
+    return f"HTTP {e.code} {e.reason} {body}".strip()
+
+
 def redfish_reset(pol, reset_type):
     host = pol["instance"]
     base = "https://" + host
     ctx = _ctx(bool(pol.get("verify_tls", False)))
-    auth = base64.b64encode(f'{pol["username"]}:{pol["password"]}'.encode()).decode()
-    headers = {"Authorization": "Basic " + auth,
-               "Accept": "application/json", "Content-Type": "application/json"}
+    user, pwd = pol["username"], pol["password"]
+    auth = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+
+    # Auth state: start with Basic; switch to a Redfish session token on 401.
+    # Supermicro X11 (fw ~1.7x) often rejects Basic Auth and requires a session.
+    state = {"token": None, "session_path": None}
+
+    def _headers():
+        h = {"Accept": "application/json", "Content-Type": "application/json"}
+        if state["token"]:
+            h["X-Auth-Token"] = state["token"]
+        else:
+            h["Authorization"] = "Basic " + auth
+        return h
+
+    def _session_login():
+        body = json.dumps({"UserName": user, "Password": pwd}).encode()
+        req = urllib.request.Request(
+            base + "/redfish/v1/SessionService/Sessions", data=body,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+            token = r.getheader("X-Auth-Token")
+            loc = r.getheader("Location")
+            if not token:
+                raise RuntimeError("session login returned no X-Auth-Token")
+            state["token"] = token
+            # Location may be absolute; store just the path for logout.
+            state["session_path"] = urlparse(loc).path if loc else None
+        log.info("%s: authenticated via Redfish session (Basic Auth rejected)", host)
+
+    def _session_logout():
+        if not state["session_path"]:
+            return
+        try:
+            req = urllib.request.Request(
+                base + state["session_path"],
+                headers={"X-Auth-Token": state["token"]}, method="DELETE")
+            urllib.request.urlopen(req, timeout=10, context=ctx).close()
+        except Exception:  # noqa: BLE001
+            pass  # best-effort cleanup
+
+    def _open(path, data=None, method="GET"):
+        """Open a request, transparently upgrading Basic->session on 401 once."""
+        for attempt in (1, 2):
+            req = urllib.request.Request(base + path, data=data,
+                                         headers=_headers(), method=method)
+            try:
+                return urllib.request.urlopen(
+                    req, timeout=(30 if method == "POST" else 15), context=ctx)
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and not state["token"] and attempt == 1:
+                    log.warning("%s: 401 on Basic Auth, retrying with session login", host)
+                    _session_login()
+                    continue
+                raise RuntimeError(_read_err(e)) from None
 
     def get(path):
-        req = urllib.request.Request(base + path, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+        with _open(path) as r:
             return json.loads(r.read().decode())
 
-    sys_id = pol.get("system_id")
-    if sys_id:
-        sys_path = "/redfish/v1/Systems/" + str(sys_id)
-    else:
-        members = get("/redfish/v1/Systems").get("Members", [])
-        if not members:
-            raise RuntimeError("no Redfish systems found")
-        sys_path = members[0]["@odata.id"]
+    try:
+        sys_id = pol.get("system_id")
+        if sys_id:
+            sys_path = "/redfish/v1/Systems/" + str(sys_id)
+        else:
+            members = get("/redfish/v1/Systems").get("Members", [])
+            if not members:
+                raise RuntimeError("no Redfish systems found")
+            sys_path = members[0]["@odata.id"]
 
-    data = get(sys_path)
-    reset = data.get("Actions", {}).get("#ComputerSystem.Reset", {})
-    target = reset.get("target", sys_path + "/Actions/ComputerSystem.Reset")
-    allowed = reset.get("ResetType@Redfish.AllowableValues")
-    if allowed and reset_type not in allowed:
-        for alt in ("GracefulShutdown", "ForceOff", "PushPowerButton"):
-            if alt in allowed:
-                log.warning("%s: %s not allowed, using %s", host, reset_type, alt)
-                reset_type = alt
-                break
-    body = json.dumps({"ResetType": reset_type}).encode()
-    req = urllib.request.Request(base + target, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
-        return f"Redfish {reset_type} -> {host} ({r.status})"
+        data = get(sys_path)
+        reset = data.get("Actions", {}).get("#ComputerSystem.Reset", {})
+        target = reset.get("target") or (sys_path.rstrip("/") + "/Actions/ComputerSystem.Reset")
+        allowed = reset.get("ResetType@Redfish.AllowableValues")
+
+        # Pick a ResetType this BMC actually supports.
+        if allowed:
+            if reset_type not in allowed:
+                chosen = next((c for c in _RESET_FALLBACKS.get(reset_type, [reset_type])
+                               if c in allowed), None)
+                if chosen is None:
+                    raise RuntimeError(
+                        f"{reset_type} unsupported and no fallback in {allowed}")
+                if chosen != reset_type:
+                    log.warning("%s: %s not allowed, using %s (allowed=%s)",
+                                host, reset_type, chosen, allowed)
+                    reset_type = chosen
+        else:
+            # No allowable list published (common on old Supermicro). If the caller
+            # asked for GracefulShutdown, prefer ForceOff which these BMCs do honor.
+            if reset_type == "GracefulShutdown":
+                log.warning("%s: no AllowableValues published; using ForceOff for shutdown", host)
+                reset_type = "ForceOff"
+
+        target_path = urlparse(target).path if target.startswith("http") else target
+        body = json.dumps({"ResetType": reset_type}).encode()
+        with _open(target_path, data=body, method="POST") as r:
+            return f"Redfish {reset_type} -> {host} ({r.status})"
+    finally:
+        _session_logout()
+
+# ---------------------------------------------------------------------------
+# Out-of-band (OOB) shutdown fallback — for BMCs where Redfish can't do a clean
+# graceful shutdown (e.g. old Supermicro X11 firmware, Redfish 1.01).
+#
+# Configured per host via an "oob_shutdown" block, e.g.:
+#   "oob_shutdown": {
+#     "method": "ipmitool",              # or "ssh"
+#     "prefer": false,                   # true = try OOB before Redfish
+#     # --- ipmitool ---
+#     "ipmi_host": "192.168.10.13",      # defaults to the instance IP
+#     "ipmi_user": "ADMIN", "ipmi_password": "…", "ipmi_interface": "lanplus",
+#     # --- ssh (shut the OS down cleanly) ---
+#     "ssh_host": "10.0.0.13", "ssh_user": "root", "ssh_port": 22,
+#     "ssh_key": "/etc/guardian/keys/smc", "ssh_command": "shutdown -h now"
+#   }
+# Only graceful/off actions use OOB; power-ON stays on Redfish (a powered-off
+# host has no OS to SSH into, and ipmitool power on is handled here too).
+# ---------------------------------------------------------------------------
+def _run(cmd, redact=(), timeout=45):
+    """Run a subprocess; return (rc, output). `redact` values are masked in logs."""
+    shown = " ".join(cmd)
+    for secret in redact:
+        if secret:
+            shown = shown.replace(secret, "***")
+    log.info("OOB exec: %s", shown)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return 127, f"{cmd[0]} not found (install it in the image)"
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
+    out = (p.stdout + p.stderr).strip()
+    for secret in redact:
+        if secret:
+            out = out.replace(secret, "***")
+    return p.returncode, out
+
+
+def oob_shutdown(pol, reset_type):
+    """Perform an out-of-band shutdown/power action. Returns a message; raises on failure."""
+    cfg = pol.get("oob_shutdown") or {}
+    method = cfg.get("method", "ipmitool")
+    host = pol["instance"]
+
+    if method == "ipmitool":
+        ipmi_host = cfg.get("ipmi_host", host)
+        user = cfg.get("ipmi_user", pol.get("username"))
+        pwd = cfg.get("ipmi_password", pol.get("password"))
+        iface = cfg.get("ipmi_interface", "lanplus")
+        chassis = {
+            "GracefulShutdown": "soft",   # ACPI graceful via BMC
+            "GracefulRestart": "cycle",
+            "ForceRestart": "reset",
+            "ForceOff": "off",
+            "On": "on",
+        }.get(reset_type, "soft")
+        cmd = ["ipmitool", "-I", iface, "-H", ipmi_host, "-U", str(user),
+               "-P", str(pwd), "chassis", "power", chassis]
+        rc, out = _run(cmd, redact=(str(pwd),))
+        if rc != 0:
+            raise RuntimeError(f"ipmitool failed (rc={rc}): {out}")
+        return f"OOB ipmitool chassis power {chassis} -> {host}: {out or 'ok'}"
+
+    if method == "ssh":
+        ssh_host = cfg.get("ssh_host", host)
+        user = cfg.get("ssh_user", "root")
+        port = str(cfg.get("ssh_port", 22))
+        remote = cfg.get("ssh_command") or (
+            "reboot" if reset_type in ("GracefulRestart", "ForceRestart") else "shutdown -h now")
+        cmd = ["ssh", "-p", port,
+               "-o", "BatchMode=yes",
+               "-o", "StrictHostKeyChecking=accept-new",
+               "-o", "ConnectTimeout=10"]
+        key = cfg.get("ssh_key")
+        if key:
+            cmd += ["-i", key]
+        cmd += [f"{user}@{ssh_host}"] + shlex.split(remote)
+        rc, out = _run(cmd)
+        # sshd may be torn down by the shutdown before it can reply cleanly (255).
+        if rc not in (0, 255):
+            raise RuntimeError(f"ssh shutdown failed (rc={rc}): {out}")
+        return f"OOB ssh '{remote}' -> {user}@{ssh_host}: {out or 'sent'}"
+
+    raise RuntimeError(f"unknown oob_shutdown method '{method}'")
+
 
 def do_power(instance, reset_type):
     pol = host_policy(instance)
@@ -102,7 +280,24 @@ def do_power(instance, reset_type):
         msg = f"[DRY-RUN] would send {reset_type} to {instance}"
         log.warning(msg)
         return msg
-    msg = redfish_reset(pol, reset_type)
+
+    oob = pol.get("oob_shutdown") or {}
+    # Power-ON never uses SSH (nothing to log into); ipmitool can, so allow it there.
+    oob_applicable = bool(oob) and (reset_type != "On" or oob.get("method") == "ipmitool")
+
+    if oob_applicable and oob.get("prefer"):
+        msg = oob_shutdown(pol, reset_type)
+        log.warning("POWER ACTION: %s", msg)
+        return msg
+
+    try:
+        msg = redfish_reset(pol, reset_type)
+    except Exception as e:  # noqa: BLE001
+        if not oob_applicable:
+            raise
+        log.warning("%s: Redfish failed (%s) — falling back to OOB %s",
+                    instance, e, oob.get("method", "ipmitool"))
+        msg = oob_shutdown(pol, reset_type) + f" [redfish fallback: {e}]"
     log.warning("POWER ACTION: %s", msg)
     return msg
 

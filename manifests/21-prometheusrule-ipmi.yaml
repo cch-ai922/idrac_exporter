@@ -1,0 +1,83 @@
+# Alert rules for the Supermicro monitored over IPMI (ipmi_exporter).
+#
+# The main rules (20-prometheusrule.yaml) key on idrac_* metric names, which the
+# Supermicro no longer emits (Redfish is license-locked). These parallel rules key
+# on ipmi_* metrics so the same anomalies still fire — and the critical ones carry
+# guardian_action: shutdown with instance=<BMC IP>, which is what the controller
+# arms on. Keep instance identical to the host key in the guardian config.
+#
+# ipmi_sensor_state encodes severity as the VALUE, same as idrac_*_health:
+#   0 = Nominal/OK   1 = Warning   2 = Critical
+# type label distinguishes temperature / fan_speed / voltage / etc.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: bmc-guardian-ipmi-rules
+  namespace: bmc-guardian
+  labels:
+    release: kube-prometheus-stack     # must match your stack's ruleSelector
+spec:
+  groups:
+    - name: bmc.health.ipmi
+      rules:
+        # ---------- informational / notify-only ----------
+        - alert: BMCUnreachableIPMI
+          expr: up{job="ipmi"} == 0
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "BMC {{ $labels.instance }} unreachable (IPMI)"
+            description: "ipmi_exporter could not scrape {{ $labels.instance }} for 5m."
+
+        - alert: SensorWarningIPMI
+          expr: ipmi_sensor_state == 1
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Sensor Warning on {{ $labels.instance }} ({{ $labels.name }})"
+            description: "IPMI sensor {{ $labels.name }} (type {{ $labels.type }}) in Warning."
+
+        - alert: HighTemperatureIPMI
+          # Coarse net; the sensor-state rule below is the primary trigger because
+          # it respects the board's own critical thresholds. Notify-only.
+          expr: ipmi_temperature_celsius > 90
+          for: 3m
+          labels: { severity: warning }
+          annotations:
+            summary: "High temp on {{ $labels.instance }}: {{ $labels.name }}"
+            description: "{{ $labels.name }} = {{ $value | printf \"%.0f\" }}C."
+
+        # ---------- critical -> ARM auto-shutdown ----------
+        # Any sensor the BMC itself flags Critical (fan loss, PSU fault, over-temp,
+        # voltage out of range) arms the shutdown countdown in the controller.
+        - alert: SensorCriticalIPMI
+          expr: ipmi_sensor_state >= 2
+          for: 2m
+          labels:
+            severity: critical
+            guardian_action: shutdown
+          annotations:
+            summary: "CRITICAL sensor on {{ $labels.instance }} ({{ $labels.name }})"
+            description: "IPMI sensor {{ $labels.name }} (type {{ $labels.type }}) Critical. Arming shutdown."
+
+        # Fan stopped (0 RPM) is an explicit cooling-loss trigger, in case the BMC
+        # reports the reading without flagging state on this firmware.
+        - alert: FanStoppedIPMI
+          expr: ipmi_fan_speed_rpm == 0
+          for: 2m
+          labels:
+            severity: critical
+            guardian_action: shutdown
+          annotations:
+            summary: "Fan stopped on {{ $labels.instance }} ({{ $labels.name }})"
+            description: "Fan at 0 RPM -> cooling loss risk. Arming shutdown."
+
+        # Optional absolute over-temp arming rule (disabled by default — enable
+        # only once you know this box's normal peak temps):
+        # - alert: OverTemperatureCriticalIPMI
+        #   expr: ipmi_temperature_celsius > 98
+        #   for: 1m
+        #   labels: { severity: critical, guardian_action: shutdown }
+        #   annotations:
+        #     summary: "Over-temp on {{ $labels.instance }}: {{ $labels.name }}"
+        #     description: "{{ $labels.name }} = {{ $value | printf \"%.0f\" }}C."

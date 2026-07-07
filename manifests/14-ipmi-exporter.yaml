@@ -1,0 +1,61 @@
+# IPMI exporter for the Supermicro host (Redfish is license-locked; see
+# 13-ipmi-exporter-secret.yaml). Multi-target, same pattern as idrac_exporter:
+# Prometheus scrapes /metrics?target=<BMC IP>&module=supermicro via a Probe.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ipmi-exporter
+  namespace: bmc-guardian
+  labels: { app: ipmi-exporter }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ipmi-exporter }
+  template:
+    metadata:
+      labels: { app: ipmi-exporter }
+    spec:
+      containers:
+        - name: ipmi-exporter
+          # Offline image — load ipmi_exporter.tar into the cluster runtime first.
+          # This tag MUST match the RepoTag inside idrac_exporter/ipmi_exporter.tar
+          # (quay.io/...:v1.10.1). Pin the tag (never :latest) so k8s uses the
+          # loaded image and never reaches the internet. See README "Offline".
+          image: quay.io/prometheuscommunity/ipmi-exporter:v1.10.1
+          args:
+            - "--config.file=/etc/ipmi/ipmi.yml"
+            - "--web.listen-address=:9290"
+          ports:
+            - { name: metrics, containerPort: 9290 }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ipmi
+              readOnly: true
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits:   { cpu: 250m, memory: 128Mi }
+          readinessProbe:
+            httpGet: { path: /, port: 9290 }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          secret:
+            secretName: ipmi-exporter-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ipmi-exporter
+  namespace: bmc-guardian
+  labels: { app: ipmi-exporter }
+spec:
+  selector: { app: ipmi-exporter }
+  ports:
+    - { name: metrics, port: 9290, targetPort: 9290 }

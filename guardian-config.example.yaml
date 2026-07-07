@@ -1,0 +1,44 @@
+# Config for app.py (FastAPI build). Mounted at /etc/guardian/config.yaml.
+# Host keys must equal the Prometheus `instance` label (the BMC IP).
+defaults:
+  dry_run: true            # true = log the action, don't actually send it
+  auto_shutdown: true      # false = warn only, never auto power-off
+  grace_seconds: 120       # countdown before auto-shutdown
+  reset_type: GracefulShutdown
+  verify_tls: false        # BMC certs are usually self-signed
+  system_id: null          # set to skip Systems-collection discovery
+
+hosts:
+  # Dell PowerEdge (iDRAC)
+  192.168.10.11:
+    username: guardian
+    password: CHANGE_ME_DELL_RW
+    grace_seconds: 180
+
+  # Lenovo (XClarity Controller)
+  192.168.10.12:
+    username: guardian
+    password: CHANGE_ME_LENOVO_RW
+
+  # Supermicro SSG-6049P-E1CR60H (X11 BMC), IP 10.20.0.20.
+  # Its Redfish DATA API is license-locked (OemLicenseNotPassed), so Redfish
+  # power control fails here too — go straight to IPMI with prefer: true.
+  # This key MUST match the ipmi Probe target and alert instance (10.20.0.20).
+  10.20.0.20:
+    username: guardian
+    password: CHANGE_ME_SMC_RW
+    oob_shutdown:
+      method: ipmitool         # "ipmitool" or "ssh"
+      prefer: true             # true = use IPMI directly (skip dead Redfish)
+      # --- ipmitool (out-of-band via BMC) ---
+      ipmi_host: 10.20.0.20    # defaults to the instance IP
+      ipmi_user: ADMIN
+      ipmi_password: CHANGE_ME_SMC_IPMI
+      ipmi_interface: lanplus
+      # --- ssh alternative (clean OS-level shutdown) ---
+      # method: ssh
+      # ssh_host: 10.0.0.13    # the OS/data-network IP, not the BMC
+      # ssh_user: root
+      # ssh_port: 22
+      # ssh_key: /etc/guardian/keys/smc
+      # ssh_command: shutdown -h now
